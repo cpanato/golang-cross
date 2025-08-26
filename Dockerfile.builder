@@ -104,7 +104,7 @@ COPY scripts/llvm.sh "${OSX_CROSS_PATH}/"
 RUN \
   # install clang-16
   if [ "${OS_CODENAME}" = "trixie" ]; then \
-    apt-get update && apt-get install -y --no-install-recommends clang-18 && \
+    ./llvm.sh 18 && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-18 100; \
   else \
