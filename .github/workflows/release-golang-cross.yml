@@ -1,9 +1,18 @@
 name: release golang-cross
 
+# Publishing is owned by the vX.Y.Z-N release tag, and nothing else. Every
+# published image is therefore signed with a cosign identity of
+# `<workflow>@refs/tags/vX.Y.Z-N`, which is what downstreams pin.
+#
+# There used to be a `push: branches: [main]` trigger that published on merge.
+# It made the same image tag get built up to three times per bump (merge, then
+# the vX.Y.Z release, then the vX.Y.Z-N release); because the build is not
+# reproducible each pass pushed a different digest, so the tag moved and the
+# previous digest was left published-but-untagged with a stale signature. Worse,
+# a bump that never got a release (1.25.14, 1.26.7, 1.27.0) ended up with its
+# only signature reading `@refs/heads/main`, which no downstream can pin to a
+# version. Dispatch from the tag ref for a manual re-release.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       versions:
@@ -39,12 +48,72 @@ jobs:
           INPUT_VERSIONS: ${{ inputs.versions }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
+          # Everything this job publishes is signed with the identity of the ref
+          # it runs on, so refuse to publish from a branch: that is how the
+          # `@refs/heads/main` signatures got created. A manual re-release
+          # dispatches against the tag (`gh workflow run ... --ref v1.27.1-0`).
+          # gh workflow run takes a workflow name, id or *file name* -- not the
+          # owner/repo/.github/workflows/... path that GITHUB_WORKFLOW_REF
+          # holds -- so reduce it to the basename or the hints below are
+          # uncopyable.
+          WF="${GITHUB_WORKFLOW_REF%%@*}"; WF="${WF##*/}"
+
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "Refusing to publish from ${GITHUB_REF} — images would be signed" >&2
+            echo "@${GITHUB_REF} instead of @refs/tags/vX.Y.Z-N. Dispatch against" >&2
+            echo "the release tag instead: gh workflow run ${WF} --ref vX.Y.Z-N" >&2
+            exit 1
+          fi
+
           # Priority: dispatch input > release tag > Pending releases in the
-          # latest merged auto-release PR body (push events skip when none).
+          # latest merged auto-release PR body.
           VERSIONS="$INPUT_VERSIONS"
 
+          # Every bump publishes TWO releases on the same commit — vX.Y.Z and
+          # vX.Y.Z-N — and both fire `release: created`. Building on both ran the
+          # whole matrix twice and, because the rebuild is not reproducible, left
+          # the image tag pointing at the second run's digest while the first
+          # run's (differently signed) digest stayed published but untagged.
+          # Anyone pinning a digest between the two releases got that orphan,
+          # whose cosign cert reads @refs/tags/vX.Y.Z. Only the build-revision
+          # tag releases, so the signing identity is always @refs/tags/vX.Y.Z-N.
+          #
+          # Accept ONLY -0, not any -N. The image tag scheme does not model the
+          # build revision: every image tag, BUILDER_TAG and the Dockerfile ARG
+          # hard-code "-0". A vX.Y.Z-1 release would therefore sign
+          # @refs/tags/vX.Y.Z-1 while (re)publishing vX.Y.Z-0-* tags, breaking
+          # the image-tag == git-tag == identity property this workflow exists
+          # to provide. Refuse loudly instead of publishing that mismatch; a
+          # bare vX.Y.Z is the expected companion release, so it is skipped
+          # quietly rather than failing the run.
+          TAG="${GITHUB_REF_NAME#v}"
+          if printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*$'; then
+            echo "Ref ${GITHUB_REF_NAME} carries a non-zero build revision." >&2
+            echo "The image tags this repo publishes hard-code -0, so this run" >&2
+            echo "would sign @refs/tags/${GITHUB_REF_NAME} while publishing" >&2
+            echo "v${TAG%-*}-0-* images. Refusing to publish that mismatch." >&2
+            exit 1
+          fi
+          if ! printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-0$'; then
+            # Quiet skip only for `release: created`, where a bare vX.Y.Z is the
+            # expected companion release and failing would make every bump red.
+            # A workflow_dispatch is someone explicitly asking for a release, so
+            # a green no-op would tell them it worked when nothing shipped --
+            # fail instead, even if they passed inputs.versions.
+            if [ "$EVENT_NAME" = "release" ]; then
+              echo "Ref ${GITHUB_REF_NAME} is not a build-revision tag (expected vX.Y.Z-0); nothing to release"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Refusing to release from ${GITHUB_REF_NAME}: not a build-revision" >&2
+            echo "tag (expected vX.Y.Z-0). Nothing would have been published, so" >&2
+            echo "failing rather than reporting success. Dispatch against the" >&2
+            echo "release tag: gh workflow run ${WF} --ref vX.Y.Z-0" >&2
+            exit 1
+          fi
+
           if [ -z "$VERSIONS" ] && [ "$EVENT_NAME" = "release" ]; then
-            MAJOR_MINOR="${GITHUB_REF_NAME#v}"; MAJOR_MINOR="${MAJOR_MINOR%.*}"
+            MAJOR_MINOR="${TAG%.*}"
             echo "Release tag: ${GITHUB_REF_NAME} (major.minor: ${MAJOR_MINOR})"
             VERSIONS="$MAJOR_MINOR"
           fi
@@ -55,9 +124,24 @@ jobs:
                  --jq 'sort_by(.mergedAt) | last | .number')
             if [ -n "$PR" ]; then
               echo "PR #${PR}"
-              VERSIONS=$(gh pr view "$PR" --json body --jq '.body' \
-                | sed -n '/## Pending releases/,/^## /p' \
-                | grep '^[[:space:]]*-' | awk '{print $2}' | paste -sd, -)
+              # Collect the majors listed under the "Pending releases" heading.
+              # The old sed range (/## Pending releases/,/^## /) never matched
+              # the "### How to release" heading that follows, so it ran to
+              # end-of-body and scraped every later list item as a pending
+              # major. Terminating on a looser /^#/ instead would break the
+              # other way: any hash at column 0 -- a fenced shell comment, a
+              # "#hashtag" -- would truncate the list early and silently
+              # release fewer majors than the PR asked for.
+              #
+              # So: skip fenced blocks entirely, treat any heading level as a
+              # section boundary, and stay "inside" only while the current
+              # heading is Pending releases.
+              VERSIONS=$(gh pr view "$PR" --json body --jq '.body' | awk '
+                /^```/                     { fence = !fence; next }
+                fence                      { next }
+                /^#+ /                     { inside = ($0 ~ /^#+[[:space:]]+Pending releases[[:space:]]*$/); next }
+                inside && /^[[:space:]]*-/ { if ($2 != "") print $2 }
+              ' | paste -sd, -)
             fi
           fi
 
@@ -68,16 +152,9 @@ jobs:
 
           echo "Versions to release: ${VERSIONS:-<none>}"
           if [ -z "$VERSIONS" ]; then
-            if [ "$EVENT_NAME" = "push" ]; then
-              echo "No Pending releases in the latest merged auto-release PR; nothing to do"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "No versions to release (no input, no release tag, no Pending releases found)"
-              exit 1
-            fi
-            exit 0
+            echo "No versions to release (no input, no release tag, no Pending releases found)"
+            exit 1
           fi
-          echo "skip=false" >> "$GITHUB_OUTPUT"
 
           # Fail loudly when a requested major has no versions.json entry.
           # The matrix jq silently drops unknown majors, so a stale Pending
@@ -116,14 +193,15 @@ jobs:
           echo "versions=${VERSIONS}" >> "$GITHUB_OUTPUT"
           echo "latest_major=$(jq -r '.supported[-1]' versions.json)" >> "$GITHUB_OUTPUT"
 
-          # Push-triggered runs re-read the Pending list of the latest merged
-          # bot PR on EVERY push to main, and that list lives in a merged PR
-          # body forever — without this guard any later hotfix merge would
-          # rebuild everything it names. Skip only when every expected final
-          # tag already exists in ghcr (a partial release still reruns);
-          # explicit dispatch always rebuilds. A failed tag listing aborts
-          # instead of falling back to a blind full rebuild.
-          if [ "$EVENT_NAME" = "push" ]; then
+          # Re-running a release that already published everything would rebuild
+          # it, and since the build is not reproducible the new digest replaces
+          # the tag and strands the old one — the same orphan-with-a-stale-
+          # signature problem, just from a re-run instead of a second tag. Skip
+          # only when every expected final tag already exists in ghcr (a partial
+          # release still reruns everything); explicit dispatch always rebuilds,
+          # which is the escape hatch for forcing a fresh digest. A failed tag
+          # listing aborts instead of falling back to a blind full rebuild.
+          if [ "$EVENT_NAME" = "release" ]; then
             chmod +x scripts/registry-tags.sh
             fetch_tags() {
               local out
@@ -134,16 +212,33 @@ jobs:
               printf '%s\n' "$out" | sort -u
             }
             TOOLS_TAGS=$(fetch_tags golang-cross-tools)
-            MAIN_ZIG_TAGS=$(fetch_tags golang-cross)
+            MAIN_TAGS=$(fetch_tags golang-cross)
             BUILDER_TAGS=$(fetch_tags golang-cross-builder)
             MISSING=$(echo "$MATRIX" | jq -r '.[] | [.major, .version, .codename, .builder] | @tsv' |
               while read -r major version codename builder; do
                 vb="${version#go}"
-                case "$builder" in
-                  zig)      want="v${vb}-0-${codename}-zig"; pool="$MAIN_ZIG_TAGS" ;;
-                  osxcross) want="v${vb}-0-${codename}";      pool="$BUILDER_TAGS" ;;
-                esac
-                grep -Fxq -- "$want" <<<"$pool" || echo "${major}: ${want}"
+                if [ "$builder" = "zig" ]; then
+                  # zig is self-contained: builder.yml publishes the final image.
+                  want="v${vb}-0-${codename}-zig"
+                  grep -Fxq -- "$want" <<<"$MAIN_TAGS" || echo "${major}: golang-cross:${want}"
+                  # The trixie zig build also owns the codename-less vX.Y.Z-0
+                  # alias. It has to be checked separately or "skip" would not
+                  # mean what it says: if the alias alone went missing (partial
+                  # push, or someone deleting a tag) the codename tag above
+                  # would still be present and the re-run would skip forever,
+                  # never restoring it.
+                  if [ "$codename" = "trixie" ]; then
+                    grep -Fxq -- "v${vb}-0" <<<"$MAIN_TAGS" || echo "${major}: golang-cross:v${vb}-0"
+                  fi
+                else
+                  # osxcross needs BOTH the builder base (builder.yml) and the
+                  # main image the release job builds FROM it. Checking only the
+                  # base would let a run where the main image failed count as
+                  # complete and skip forever.
+                  want="v${vb}-0-${codename}"
+                  grep -Fxq -- "$want" <<<"$BUILDER_TAGS" || echo "${major}: golang-cross-builder:${want}"
+                  grep -Fxq -- "$want" <<<"$MAIN_TAGS" || echo "${major}: golang-cross:${want}"
+                fi
                 tools="v${vb}-0-${codename}"
                 grep -Fxq -- "$tools" <<<"$TOOLS_TAGS" || echo "${major}: golang-cross-tools:${tools}"
               done)
@@ -156,6 +251,11 @@ jobs:
             echo "$MISSING"
           fi
 
+          # Written exactly once, and only here: the skip=true paths above all
+          # exit immediately. Emitting the key twice leaves which value wins up
+          # to the runner's parser.
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
           echo "Matrix: ${MATRIX}"
 
   build-builder:
@@ -165,7 +265,13 @@ jobs:
     # FROM below needs them in the registry.
     uses: ./.github/workflows/builder.yml
     with:
-      ref: main
+      # Build from the ref that triggered this release, NOT from main. These
+      # images are signed with an identity of @refs/tags/vX.Y.Z-N, so building
+      # them from main would attest a tag while shipping whatever main happens
+      # to hold — and main moves the moment any other PR merges between the
+      # bump landing and the release being cut. The `release` job below already
+      # checks out the triggering ref; this makes build-builder agree with it.
+      ref: ${{ github.ref }}
       version: ${{ needs.resolve.outputs.versions }}
       latest_major: ${{ needs.resolve.outputs.latest_major }}
       publish_latest: true

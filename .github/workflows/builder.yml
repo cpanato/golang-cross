@@ -56,6 +56,26 @@ jobs:
       matrix_tools: ${{ steps.set-matrix.outputs.matrix_tools }}
       latest_major: ${{ steps.latest.outputs.major }}
     steps:
+      # Publishing is owned by the vX.Y.Z-N release tag. release-golang-cross.yml
+      # refuses to run from a branch for that reason, but this workflow is
+      # independently dispatchable AND publishes and signs, so without the same
+      # rule here the invariant is only half enforced: a dispatch from main
+      # would publish images signed @refs/heads/main, which is exactly the
+      # identity that made 1.25.14 / 1.26.7 / 1.27.0 unpinnable.
+      #
+      # The condition mirrors the `push:` expression on the build step below,
+      # so the guard and the actual push can never disagree. push_images: false
+      # is the PR-stage build and stays allowed from a branch: it publishes
+      # none of the images consumers pin.
+      - name: Refuse to publish from a non-tag ref
+        if: inputs.push_images != false && github.ref_type != 'tag'
+        run: |
+          echo "Refusing to publish from ${GITHUB_REF} (${GITHUB_REF_TYPE})." >&2
+          echo "Images would be signed @${GITHUB_REF} instead of" >&2
+          echo "@refs/tags/vX.Y.Z-N. Dispatch against the release tag:" >&2
+          echo "  gh workflow run builder.yml --ref vX.Y.Z-N" >&2
+          exit 1
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -224,6 +244,16 @@ jobs:
             echo "tag_suffix=" >> "$GITHUB_OUTPUT"
           fi
 
+      # The last tag mirrors the git release tag verbatim (git v1.27.1-0 ->
+      # image v1.27.1-0), so an image can be pinned with the same string that
+      # published and signed it. Only the trixie zig build publishes it — the
+      # variant `latest` also points at — because a major can ship two codenames
+      # and two toolchains (1.24 = osxcross + zig), and the alias has to resolve
+      # to exactly one of them. It is derived from the matrix version rather than
+      # GITHUB_REF_NAME on purpose: a dispatch can release several majors from a
+      # single tag ref, which names only one of them. The "-0" is the build
+      # revision the auto-release always cuts, so a hand-made vX.Y.Z-1 git tag
+      # would still publish vX.Y.Z-0 here.
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -233,6 +263,7 @@ jobs:
             type=raw,value=latest,enable=${{ inputs.publish_latest != false && matrix.gover == needs.load-versions.outputs.latest_major && matrix.codename == 'trixie' }}
             type=raw,value=v${{ steps.dockerfile.outputs.go_bare }}-0-${{ matrix.codename }}${{ steps.dockerfile.outputs.tag_suffix }}
             type=raw,value=${{ matrix.gover }}${{ steps.dockerfile.outputs.tag_suffix }}
+            type=raw,value=v${{ steps.dockerfile.outputs.go_bare }}-0,enable=${{ matrix.builder == 'zig' && matrix.codename == 'trixie' }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
