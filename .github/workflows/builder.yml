@@ -29,6 +29,10 @@ on:  # zizmor: ignore[concurrency-limits]
         description: Push built images to the registry (default true; false = build locally for smoke-test only).
         type: boolean
         required: false
+      revision:
+        description: Image build revision N used in the vX.Y.Z-N image tags (default 0). release-golang-cross.yml passes the N from the release tag.
+        type: string
+        required: false
   workflow_call:
     inputs:
       ref:
@@ -50,6 +54,10 @@ on:  # zizmor: ignore[concurrency-limits]
       push_images:
         description: Push built images to the registry (default true; false = build locally for smoke-test only).
         type: boolean
+        required: false
+      revision:
+        description: Image build revision N used in the vX.Y.Z-N image tags (default 0). release-golang-cross.yml passes the N from the release tag.
+        type: string
         required: false
 
 permissions: {}
@@ -171,7 +179,7 @@ jobs:
         with:
           images: ghcr.io/${{ steps.get_repo_owner.outputs.repo_owner }}/golang-cross-tools
           tags: |
-            type=raw,value=v${{ steps.tools.outputs.go_bare }}-0-${{ matrix.codename }}
+            type=raw,value=v${{ steps.tools.outputs.go_bare }}-${{ inputs.revision || '0' }}-${{ matrix.codename }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -281,9 +289,9 @@ jobs:
           images: ghcr.io/${{ steps.get_repo_owner.outputs.repo_owner }}/${{ steps.dockerfile.outputs.image }}
           tags: |
             type=raw,value=latest,enable=${{ inputs.publish_latest != false && matrix.gover == needs.load-versions.outputs.latest_major && matrix.codename == 'trixie' }}
-            type=raw,value=v${{ steps.dockerfile.outputs.go_bare }}-0-${{ matrix.codename }}${{ steps.dockerfile.outputs.tag_suffix }}
+            type=raw,value=v${{ steps.dockerfile.outputs.go_bare }}-${{ inputs.revision || '0' }}-${{ matrix.codename }}${{ steps.dockerfile.outputs.tag_suffix }}
             type=raw,value=${{ matrix.gover }}${{ steps.dockerfile.outputs.tag_suffix }}
-            type=raw,value=v${{ steps.dockerfile.outputs.go_bare }}-0,enable=${{ matrix.builder == 'zig' && matrix.codename == 'trixie' }}
+            type=raw,value=v${{ steps.dockerfile.outputs.go_bare }}-${{ inputs.revision || '0' }},enable=${{ matrix.builder == 'zig' && matrix.codename == 'trixie' }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -345,8 +353,9 @@ jobs:
         env:
           REPO_OWNER: ${{ steps.get_repo_owner.outputs.repo_owner }}
           GO_BARE: ${{ steps.dockerfile.outputs.go_bare }}
+          REVISION: ${{ inputs.revision || '0' }}
         run: |
-          IMAGE="ghcr.io/${REPO_OWNER}/golang-cross:v${GO_BARE}-0-trixie-zig"
+          IMAGE="ghcr.io/${REPO_OWNER}/golang-cross:v${GO_BARE}-${REVISION}-trixie-zig"
           echo "smoke-testing ${IMAGE}"
           cd example/sqlite-example && make smoke-test IMAGE="${IMAGE}" CONFIG=.goreleaser.zig.yml
           cd ../openssl-example && make smoke-test IMAGE="${IMAGE}"
