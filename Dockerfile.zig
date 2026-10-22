@@ -20,7 +20,7 @@
 
 # NOTE: GO_VERSION is WITHOUT the "go" prefix. It selects the shared
 # golang-cross-tools base image tag (v<GO_VERSION>-0-<OS_CODENAME>).
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.3
 ARG OS_CODENAME=trixie
 ARG OSK_SDK=macos-13
 
@@ -32,7 +32,7 @@ FROM ghcr.io/gythialy/golang-cross-tools:v${GO_VERSION}-0-${OS_CODENAME:-trixie}
 
 # Re-declare ARG after FROM to make it available in this stage
 ARG OS_CODENAME=trixie
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 ARG TARGETARCH
 
 LABEL maintainer="Goren G<gythialy.koo+github@gmail.com>"
